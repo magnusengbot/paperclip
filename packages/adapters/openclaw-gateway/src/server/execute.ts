@@ -424,6 +424,7 @@ function buildStandardPaperclipPayload(
   wakePayload: WakePayload,
   paperclipEnv: Record<string, string>,
   payloadTemplate: Record<string, unknown>,
+  resolvedModel: string | null,
 ): Record<string, unknown> {
   const templatePaperclip = parseObject(payloadTemplate.paperclip);
   const workspace = asRecord(ctx.context.paperclipWorkspace);
@@ -450,6 +451,7 @@ function buildStandardPaperclipPayload(
     approvalId: wakePayload.approvalId,
     approvalStatus: wakePayload.approvalStatus,
     apiUrl: paperclipEnv.PAPERCLIP_API_URL ?? null,
+    ...(resolvedModel ? { model: resolvedModel } : {}),
   };
 
   if (workspace) {
@@ -1073,7 +1075,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const templateMessage = nonEmpty(payloadTemplate.message) ?? nonEmpty(payloadTemplate.text);
   const message = templateMessage ? appendWakeText(templateMessage, wakeText) : wakeText;
-  const paperclipPayload = buildStandardPaperclipPayload(ctx, wakePayload, paperclipEnv, payloadTemplate);
+  const resolvedModel =
+    nonEmpty(ctx.config.model) ??
+    nonEmpty(payloadTemplate.model) ??
+    nonEmpty(asString(ctx.context.model, "")) ??
+    null;
+
+  const paperclipPayload = buildStandardPaperclipPayload(ctx, wakePayload, paperclipEnv, payloadTemplate, resolvedModel);
 
   const agentParams: Record<string, unknown> = {
     ...payloadTemplate,
@@ -1085,6 +1093,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   if (configuredAgentId && !nonEmpty(agentParams.agentId)) {
     agentParams.agentId = configuredAgentId;
+  }
+
+  if (resolvedModel && !nonEmpty(agentParams.model)) {
+    agentParams.model = resolvedModel;
   }
 
   if (typeof agentParams.timeout !== "number") {
@@ -1109,6 +1121,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     "stdout",
     `[openclaw-gateway] outbound payload (redacted): ${stringifyForLog(redactForLog(agentParams), 12_000)}\n`,
   );
+  if (resolvedModel) {
+    await ctx.onLog("stdout", `[openclaw-gateway] model: ${resolvedModel}\n`);
+  }
   await ctx.onLog("stdout", `[openclaw-gateway] outbound header keys: ${outboundHeaderKeys.join(", ")}\n`);
   if (transportHint) {
     await ctx.onLog(
