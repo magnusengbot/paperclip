@@ -33,7 +33,35 @@ import { isAllowedContentType, MAX_ATTACHMENT_BYTES } from "../attachment-types.
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 
+function buildInReviewWakeupIdempotencyKey(issueId: string, bucketSeed: string) {
+  return `issue_in_review:${issueId}:${bucketSeed}`;
+}
+
+export function shouldAutoHandoffInReview(input: {
+  fromStatus: string;
+  toStatus: string | undefined;
+  assigneeAgentId: string | null;
+  reviewerAgentId: string | null;
+}) {
+  return (
+    input.toStatus === "in_review" &&
+    input.fromStatus !== "in_review" &&
+    Boolean(input.assigneeAgentId) &&
+    Boolean(input.reviewerAgentId) &&
+    input.assigneeAgentId !== input.reviewerAgentId
+  );
+}
+
+
+export function shouldClearStaleExecutionLockBeforeHandoff(input: {
+  autoHandoffToReviewer: boolean;
+  executionRunId: string | null;
+}) {
+  return input.autoHandoffToReviewer && Boolean(input.executionRunId);
+}
+
 export function issueRoutes(db: Db, storage: StorageService) {
+
   const router = Router();
   const svc = issueService(db);
   const access = accessService(db);
@@ -104,6 +132,16 @@ export function issueRoutes(db: Db, storage: StorageService) {
       throw forbidden("Missing permission: tasks:assign");
     }
     throw unauthorized();
+  }
+
+  async function resolveReviewerAgentId(companyId: string, assigneeAgentId: string) {
+    const assignee = await agentsSvc.getById(assigneeAgentId);
+    if (!assignee || assignee.companyId !== companyId) return null;
+    if (assignee.reportsTo) return assignee.reportsTo;
+
+    const companyAgents = await agentsSvc.list(companyId);
+    const reviewer = companyAgents.find((agent) => agent.role === "cto") ?? companyAgents.find((agent) => agent.role === "ceo");
+    return reviewer?.id ?? null;
   }
 
   function requireAgentRunId(req: Request, res: Response) {
@@ -713,6 +751,35 @@ export function issueRoutes(db: Db, storage: StorageService) {
     if (hiddenAtRaw !== undefined) {
       updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
     }
+
+    const requestedAssigneeAgentId =
+      updateFields.assigneeAgentId !== undefined ? updateFields.assigneeAgentId : existing.assigneeAgentId;
+    const reviewerAgentId = requestedAssigneeAgentId
+      ? await resolveReviewerAgentId(existing.companyId, requestedAssigneeAgentId)
+      : null;
+    const autoHandoffToReviewer = shouldAutoHandoffInReview({
+      fromStatus: existing.status,
+      toStatus: updateFields.status,
+      assigneeAgentId: requestedAssigneeAgentId ?? null,
+      reviewerAgentId,
+    });
+
+    if (
+      autoHandoffToReviewer &&
+      reviewerAgentId &&
+      shouldClearStaleExecutionLockBeforeHandoff({
+        autoHandoffToReviewer,
+        executionRunId: existing.executionRunId,
+      })
+    ) {
+      await svc.releaseStaleExecutionLock(id);
+    }
+
+    if (autoHandoffToReviewer && reviewerAgentId) {
+      updateFields.assigneeAgentId = reviewerAgentId;
+      updateFields.assigneeUserId = null;
+    }
+
     let issue;
     try {
       issue = await svc.update(id, updateFields);
@@ -799,7 +866,9 @@ export function issueRoutes(db: Db, storage: StorageService) {
 
     }
 
-    const assigneeChanged = assigneeWillChange;
+    const assigneeChanged =
+      issue.assigneeAgentId !== existing.assigneeAgentId ||
+      issue.assigneeUserId !== existing.assigneeUserId;
     const statusChangedFromBacklog =
       existing.status === "backlog" &&
       issue.status !== "backlog" &&
@@ -830,6 +899,19 @@ export function issueRoutes(db: Db, storage: StorageService) {
           requestedByActorType: actor.actorType,
           requestedByActorId: actor.actorId,
           contextSnapshot: { issueId: issue.id, source: "issue.status_change" },
+        });
+      }
+
+      if (autoHandoffToReviewer && issue.assigneeAgentId) {
+        wakeups.set(issue.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_in_review_handoff",
+          payload: { issueId: issue.id, mutation: "update" },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          idempotencyKey: buildInReviewWakeupIdempotencyKey(issue.id, `handoff:${issue.updatedAt?.toISOString?.() ?? "now"}`),
+          contextSnapshot: { issueId: issue.id, source: "issue.in_review_handoff", wakeReason: "issue_in_review_handoff" },
         });
       }
 

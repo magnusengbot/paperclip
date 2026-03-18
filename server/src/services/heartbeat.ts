@@ -45,6 +45,7 @@ const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+const IN_REVIEW_RESCUE_DELAY_MS = 2 * 60 * 1000;
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const SESSIONED_LOCAL_ADAPTERS = new Set([
@@ -2826,6 +2827,42 @@ export function heartbeatService(db: Db) {
         });
         if (run) enqueued += 1;
         else skipped += 1;
+      }
+
+      const rescueBefore = new Date(now.getTime() - IN_REVIEW_RESCUE_DELAY_MS);
+      const inReviewCandidates = await db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          assigneeAgentId: issues.assigneeAgentId,
+        })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.status, "in_review"),
+            sql`${issues.assigneeAgentId} is not null`,
+            sql`${issues.updatedAt} <= ${rescueBefore}`,
+          ),
+        );
+
+      for (const issue of inReviewCandidates) {
+        if (!issue.assigneeAgentId) continue;
+        await enqueueWakeup(issue.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_in_review_rescue",
+          payload: { issueId: issue.id, mutation: "watchdog" },
+          requestedByActorType: "system",
+          requestedByActorId: "heartbeat_scheduler",
+          idempotencyKey: `issue_in_review_rescue:${issue.id}:${Math.floor(now.getTime() / IN_REVIEW_RESCUE_DELAY_MS)}`,
+          contextSnapshot: {
+            issueId: issue.id,
+            source: "issue.in_review_watchdog",
+            wakeReason: "issue_in_review_rescue",
+          },
+        }).catch((err) => {
+          logger.warn({ err, issueId: issue.id, assigneeAgentId: issue.assigneeAgentId }, "failed in_review rescue wakeup");
+        });
       }
 
       return { checked, enqueued, skipped };

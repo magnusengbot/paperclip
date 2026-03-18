@@ -434,6 +434,38 @@ export function issueService(db: Db) {
     return adopted;
   }
 
+  async function releaseStaleExecutionLock(issueId: string) {
+    const issue = await db
+      .select({
+        id: issues.id,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+
+    if (!issue?.executionRunId) return false;
+
+    const stale = await isTerminalOrMissingHeartbeatRun(issue.executionRunId);
+    if (!stale) return false;
+
+    const now = new Date();
+    const cleared = await db
+      .update(issues)
+      .set({
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: now,
+      })
+      .where(and(eq(issues.id, issue.id), eq(issues.executionRunId, issue.executionRunId)))
+      .returning({ id: issues.id })
+      .then((rows) => rows[0] ?? null);
+
+    return Boolean(cleared);
+  }
+
+
   return {
     list: async (companyId: string, filters?: IssueFilters) => {
       const conditions = [eq(issues.companyId, companyId)];
@@ -1526,5 +1558,6 @@ export function issueService(db: Db) {
         goal: a.goalId ? goalMap.get(a.goalId) ?? null : null,
       }));
     },
+    releaseStaleExecutionLock,
   };
 }
